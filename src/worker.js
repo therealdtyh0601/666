@@ -12,8 +12,6 @@
  * - TELEGRAM_SECRET_TOKEN (optional but recommended)
  */
 
-const MAX_DURATION = 300; // 5 minutes
-
 export default {
   async fetch(request, env) {
     try {
@@ -62,11 +60,6 @@ export default {
       const messageId = msg.message_id;
       if (!chatId || !messageId) {
         return new Response("Missing chat/message id", { status: 200 });
-      }
-
-      // If it’s a video and too long, ignore (do nothing)
-      if (msg.video?.duration && msg.video.duration >= MAX_DURATION) {
-        return new Response("Video too long - ignored", { status: 200 });
       }
 
       // Build sanitized caption/text

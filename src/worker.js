@@ -1,145 +1,111 @@
 /**
- * Cloudflare Worker Telegram bot (webhook)
- * Features:
- * - Sanitize text/caption: remove Markdown-ish chars: * _ ~ ` |
- * - Repost sanitized content (text -> sendMessage, media -> copyMessage with caption)
- * - Delete original message (best-effort)
- * - Ignore long videos > MAX_DURATION seconds
- * - Optional secret token verification via X-Telegram-Bot-Api-Secret-Token header
+ * Simple Telegram reupload bot (Cloudflare Workers)
+ * - Downloads media from Telegram
+ * - Reuploads it
+ * - Copies caption (plain text)
+ * - Deletes original message
  *
- * Secrets to set:
- * - BOT_TOKEN (required)
- * - TELEGRAM_SECRET_TOKEN (optional but recommended)
+ * Required secret:
+ * - BOT_TOKEN
  */
 
 export default {
   async fetch(request, env) {
+    if (request.method !== "POST") {
+      return new Response("OK");
+    }
+
+    const update = await request.json();
+    const msg = update.message || update.channel_post;
+
+    if (!msg) return new Response("No message");
+
+    const chatId = msg.chat.id;
+    const messageId = msg.message_id;
+    const caption = msg.caption || msg.text || "";
+
     try {
-      const url = new URL(request.url);
+      // MEDIA HANDLING
+      if (msg.photo || msg.video || msg.document || msg.audio || msg.voice) {
+        const fileId = extractFileId(msg);
+        if (!fileId) return new Response("No file_id");
 
-      // Health check / simple GET
-      if (request.method === "GET") {
-        return new Response("OK");
-      }
+        // 1️⃣ Get file path from Telegram
+        const filePath = await getFilePath(env.BOT_TOKEN, fileId);
 
-      // Only accept POST for webhook
-      if (request.method !== "POST") {
-        return new Response("Method Not Allowed", { status: 405 });
-      }
+        // 2️⃣ Download file
+        const fileUrl = `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${filePath}`;
+        const fileResp = await fetch(fileUrl);
+        const fileBuffer = await fileResp.arrayBuffer();
 
-      // Optional: lock to a specific path
-      // e.g., only accept /webhook
-      if (url.pathname !== "/" && url.pathname !== "/webhook") {
-        return new Response("Not Found", { status: 404 });
-      }
+        // 3️⃣ Reupload (sendDocument works for all file types safely)
+        await telegramUpload(env.BOT_TOKEN, chatId, fileBuffer, caption);
 
-      // Optional: verify Telegram secret token header
-      // Set via setWebhook secret_token=...
-      if (env.TELEGRAM_SECRET_TOKEN) {
-        const headerToken = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
-        if (!headerToken || headerToken !== env.TELEGRAM_SECRET_TOKEN) {
-          return new Response("Unauthorized", { status: 401 });
-        }
-      }
-
-      const update = await request.json();
-
-      // Handle message or edited_message (you can extend as needed)
-      const msg =
-        update?.message ||
-        update?.edited_message ||
-        update?.channel_post ||
-        update?.edited_channel_post;
-
-      if (!msg) {
-        return new Response("No message in update", { status: 200 });
-      }
-
-      // Ignore service messages without text/caption/media
-      const chatId = msg.chat?.id;
-      const messageId = msg.message_id;
-      if (!chatId || !messageId) {
-        return new Response("Missing chat/message id", { status: 200 });
-      }
-
-      // Build sanitized caption/text
-      const rawText = msg.text ?? msg.caption ?? "";
-      const cleaned = sanitizeText(rawText);
-
-      // Decide if media message
-      const isMedia =
-        !!msg.photo ||
-        !!msg.document ||
-        !!msg.audio ||
-        !!msg.voice ||
-        !!msg.video ||
-        !!msg.animation ||
-        !!msg.sticker ||
-        !!msg.video_note;
-
-      // Repost sanitized
-      if (isMedia) {
-        // copyMessage supports caption for most media types
-        await telegramCall(env.BOT_TOKEN, "copyMessage", {
-          chat_id: chatId,
-          from_chat_id: chatId,
-          message_id: messageId,
-          caption: cleaned || undefined,
-          // Keep it plain; if you want markdown, you'd need different sanitization
-          parse_mode: undefined
-        });
       } else if (msg.text) {
-        // Pure text
-        if (cleaned) {
-          await telegramCall(env.BOT_TOKEN, "sendMessage", {
-            chat_id: chatId,
-            text: cleaned
-          });
-        } else {
-          // If cleaned becomes empty, do nothing
-          return new Response("Empty after sanitize", { status: 200 });
-        }
+        // TEXT ONLY
+        await telegramSendMessage(env.BOT_TOKEN, chatId, msg.text);
       } else {
-        // Nothing we can handle (e.g. contact, location) - do nothing
-        return new Response("Unhandled message type", { status: 200 });
+        return new Response("Unsupported type");
       }
 
-      // Delete original message (best effort)
-      // Requires bot to have rights in groups/channels
-      await telegramCall(env.BOT_TOKEN, "deleteMessage", {
-        chat_id: chatId,
-        message_id: messageId
-      }).catch(() => {});
+      // 4️⃣ Delete original
+      await telegramDelete(env.BOT_TOKEN, chatId, messageId).catch(() => {});
 
-      return new Response("Done", { status: 200 });
-    } catch (err) {
-      // Never throw raw errors back to Telegram; keep 200 so Telegram doesn't retry forever
-      return new Response("Error handled", { status: 200 });
+      return new Response("Done");
+    } catch (e) {
+      return new Response("Handled error", { status: 200 });
     }
   }
 };
 
-function sanitizeText(text) {
-  if (!text) return "";
-  // matches your Python: remove ["*", "_", "~", "`", "||"] effectively -> remove * _ ~ ` and |
-  // (removing '|' catches the '||' as well)
-  return text.replace(/[*_~`|]/g, "").trim();
+/* ---------------- helpers ---------------- */
+
+function extractFileId(msg) {
+  if (msg.photo) return msg.photo[msg.photo.length - 1].file_id;
+  if (msg.video) return msg.video.file_id;
+  if (msg.document) return msg.document.file_id;
+  if (msg.audio) return msg.audio.file_id;
+  if (msg.voice) return msg.voice.file_id;
+  return null;
 }
 
-async function telegramCall(botToken, method, payload) {
-  if (!botToken) throw new Error("Missing BOT_TOKEN");
-  const url = `https://api.telegram.org/bot${botToken}/${method}`;
+async function getFilePath(token, fileId) {
+  const res = await fetch(
+    `https://api.telegram.org/bot${token}/getFile`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file_id: fileId })
+    }
+  );
+  const data = await res.json();
+  return data.result.file_path;
+}
 
-  const res = await fetch(url, {
+async function telegramUpload(token, chatId, buffer, caption) {
+  const form = new FormData();
+  form.append("chat_id", chatId);
+  form.append("document", new Blob([buffer]));
+  if (caption) form.append("caption", caption);
+
+  await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
+    method: "POST",
+    body: form
+  });
+}
+
+async function telegramSendMessage(token, chatId, text) {
+  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload)
+    body: JSON.stringify({ chat_id: chatId, text })
   });
+}
 
-  const data = await res.json().catch(() => null);
-  if (!res.ok || !data?.ok) {
-    const desc = data?.description || `HTTP ${res.status}`;
-    throw new Error(`Telegram API error: ${method}: ${desc}`);
-  }
-  return data.result;
+async function telegramDelete(token, chatId, messageId) {
+  await fetch(`https://api.telegram.org/bot${token}/deleteMessage`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, message_id: messageId })
+  });
 }

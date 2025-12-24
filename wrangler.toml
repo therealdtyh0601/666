@@ -1,0 +1,6 @@
+name = "telegram-sanitizer-worker"
+main = "src/worker.js"
+compatibility_date = "2025-01-01"
+
+# Optional: if you want a custom route on your domain later.
+# routes = [{ pattern = "yourdomain.com/telegram/*", zone_name = "yourdomain.com" }]
